@@ -2910,13 +2910,15 @@ function openFisDetay(idx){
   var addBtn='<button class="btn btn-outline btn-sm" onclick="openFisPaymentModal()">'+(r.tur==='gelir'?'Tahsilat İşle':'Ödeme İşle')+'</button>';
   var rowsHtml='';
   if(linkedPayments.length){
-    rowsHtml=linkedPayments.map(function(k){
-      return '<div style="display:grid;grid-template-columns:100px 1fr auto;align-items:center;padding:9px 12px;border-top:1px solid var(--border);gap:8px">'+
-        '<span style="font-size:12px;color:var(--text-secondary)">'+k.tarih+'</span>'+
-        '<span style="font-size:12px;color:var(--muted)">'+(k.kasa||'Kasa Hesabı')+'</span>'+
-        '<span style="font-family:\'JetBrains Mono\',monospace;font-weight:600;color:var(--accent)">'+fmt(k.tutar)+'</span>'+
-      '</div>';
-    }).join('');
+    var toplamOdeme=linkedPayments.reduce(function(s,k){return s+toSafeNumber(k.tutar);},0);
+    var enSonTarih=linkedPayments.reduce(function(t,k){return (k.tarih||'')>t?(k.tarih||''):t;},'');
+    var aciklama=linkedPayments.length===1?(linkedPayments[0].kasa||'Kasa Hesabi'):linkedPayments.length+' kasa hareketi (avans mahsubu)';
+    var odemeRenk='var(--accent)';
+    rowsHtml='<div style="display:grid;grid-template-columns:100px 1fr auto;align-items:center;padding:9px 12px;border-top:1px solid var(--border);gap:8px">'+
+      '<span style="font-size:12px;color:var(--text-secondary)">'+enSonTarih+'</span>'+
+      '<span style="font-size:12px;color:var(--muted)">'+aciklama+'</span>'+
+      '<span style="font-family:monospace;font-weight:600;color:'+odemeRenk+'">'+fmt(toplamOdeme)+'</span>'+
+    '</div>';
   } else if(r.odenen&&r.odenen>0){
     var odenenTarih=r.odeme_tarih||r.vade||r.tarih;
     var odenenRenk=r.tur==='gelir'?'var(--accent)':'var(--danger)';
@@ -3141,15 +3143,65 @@ function satisEkstrePDF(){ faturaPdfYazdir(); }
 function fdSil(){
   if(fdAktifIdx<0)return;
   closeModal('modal-fis-detay');
-  showConfirm('Bu kayit silinsin mi?',async function(){
+  showConfirm('Bu kayit silinsin mi? Ilgili odeme/tahsilat kayitlari da silinecek.',async function(){
     var rec=state.gelirGider[fdAktifIdx];
+    if(!rec)return;
+
+    // 1) Ilgili kasa kayitlarini sil
+    var silinecekKasaIds=[];
+    state.kasa=(state.kasa||[]).filter(function(k){
+      var esles=false;
+      if(rec.sb_id && k.kaynak_id && k.kaynak_id===rec.sb_id) esles=true;
+      if(rec.local_ref && k.kaynak_local_id && k.kaynak_local_id===rec.local_ref) esles=true;
+      if(k.allocations){
+        k.allocations.forEach(function(a){
+          if(rec.sb_id && a.kaynak_id===rec.sb_id) esles=true;
+          if(rec.local_ref && a.kaynak_local_id===rec.local_ref) esles=true;
+        });
+      }
+      if(esles && k.sb_id) silinecekKasaIds.push(k.sb_id);
+      return !esles;
+    });
+
+    // 2) Ilgili borcAlacak kayitlarini sil
+    var silinecekBaIds=[];
+    state.borcAlacak=(state.borcAlacak||[]).filter(function(b){
+      var esles=false;
+      if(rec.sb_id && b.kaynak_id && b.kaynak_id===rec.sb_id) esles=true;
+      if(rec.local_ref && b.kaynak_local_id && b.kaynak_local_id===rec.local_ref) esles=true;
+      if(esles && b.sb_id) silinecekBaIds.push(b.sb_id);
+      return !esles;
+    });
+
+    // 3) Masraf icin eski usul kasa eslesme (kaynak_id olmayan eski kayitlar)
+    if(rec.tur==='masraf' && rec.odenen>0){
+      state.kasa=(state.kasa||[]).filter(function(k){
+        var esles=k.tur==='cikis'&&k.tarih===rec.tarih&&Math.abs(k.tutar-rec.odenen)<0.01&&
+          (k.aciklama===(rec.aciklama||'')|| k.aciklama===(rec.kategori||''));
+        if(esles && k.sb_id) silinecekKasaIds.push(k.sb_id);
+        return !esles;
+      });
+    }
+
+    // 4) Ana kaydi sil
     state.gelirGider.splice(fdAktifIdx,1);
     save();
-    renderOzet();renderSatislar();renderAlislar();renderMasraflar();
-    showToast('Kayit silindi');
-    try{if(rec&&rec.sb_id)await deleteGelirGiderFromSupabase(rec.sb_id);}catch(e){console.warn('Fatura silme Supabase senkron hatasi:',e); showToast('⚠️ Fatura silme buluta yansıtılamadı', true);}
+    renderOzet();renderSatislar();renderAlislar();renderMasraflar();renderKasa();
+    showToast('Kayit ve ilgili odemeler silindi');
+
+    // 5) Supabase senkron
+    try{
+      if(rec.sb_id) await deleteGelirGiderFromSupabase(rec.sb_id);
+      for(var i=0;i<silinecekKasaIds.length;i++){
+        try{await deleteKasaFromSupabase(silinecekKasaIds[i]);}catch(e2){}
+      }
+      for(var j=0;j<silinecekBaIds.length;j++){
+        try{await deleteBorcAlacakFromSupabase(silinecekBaIds[j]);}catch(e3){}
+      }
+    }catch(e){console.warn('Silme Supabase senkron hatasi:',e);showToast('⚠️ Silme buluta yansitilamadi',true);}
   });
 }
+
 function fdDuzenle(){
   var r=state.gelirGider[fdAktifIdx];if(!r)return;
   fddKalemler=r.kalemler?r.kalemler.map(function(k){return Object.assign({},k);}):[];
@@ -3932,7 +3984,7 @@ function buildFaturaAciklama(tip,kalemler){
 }
 function buildFaturaRecord(formData){
   var kalemler=normalizeFaturaKalemleri(formData.kalemler);
-  var toplamTutar=sumBy(kalemler,function(k){return toSafeNumber(k.toplam)+toSafeNumber(k.kdv);});
+  var toplamTutar=Math.round(sumBy(kalemler,function(k){return toSafeNumber(k.toplam)+toSafeNumber(k.kdv);})*100)/100;
   var odenenTutar=0;
   var kalanTutar=toplamTutar;
   var fatura={
@@ -3959,12 +4011,80 @@ function applyStockEffect(tip,kalemler){
   if(tip==='satis'){stokDus(kalemler);return;}
   stokEkle(kalemler);
 }
+function getAvanslarForFatura(fatura){
+  // Faturadan ONCE yapilmis, hicbir faturaya baglanmamis kasa odemelerini bul
+  var hedefKasaTur = fatura.tur==='gider' ? 'cikis' : 'giris';
+  var fatTarih = fatura.tarih || '';
+  return getStateArray('kasa').filter(function(k){
+    if(k.tur !== hedefKasaTur) return false;
+    if(!isSameCariRef(k.cari_id, k.cari, fatura.cari_id, fatura.musteri)) return false;
+    // Faturadan sonraki odemeleri alma
+    if((k.tarih||'') > fatTarih) return false;
+    // Zaten bir faturaya kaynak_id ile baglilarsa atla
+    if(k.kaynak_id || k.kaynak_local_id) return false;
+    // Avans mahsubu olarak olusturulmuslari atla
+    if(k.kategori === 'Avans Mahsubu') return false;
+    // Allocations ile tamamen dagitilmis olanlari atla
+    var dagitilan = (k.allocations||[]).reduce(function(s,a){return s+toSafeNumber(a.tutar);},0);
+    return (toSafeNumber(k.tutar) - dagitilan) > 0.01;
+  }).sort(function(a,b){return (a.tarih||'').localeCompare(b.tarih||'');});
+}
+
+function applyAvansToNewFatura(fatura){
+  // Kasadaki onceki avans odemelerini faturaya mahsup et
+  // KASA HAREKETI OLUSTURMAZ - para zaten cikmis, sadece faturaya bagla
+  if(!fatura.cari_id && !fatura.musteri) return [];
+  var fatTutar = toSafeNumber(fatura.tutar);
+
+  // Kasadaki baglanmamis avans odemelerinin TOPLAMINI bul
+  var avanslar = getAvanslarForFatura(fatura);
+  var toplamAvans = avanslar.reduce(function(sum, k){
+    var dagitilan = (k.allocations||[]).reduce(function(s,a){return s+toSafeNumber(a.tutar);},0);
+    return sum + Math.max(0, toSafeNumber(k.tutar) - dagitilan);
+  }, 0);
+  toplamAvans = Math.round(toplamAvans * 100) / 100;
+
+  if(toplamAvans <= 0.01) return [];
+
+  // Mahsup tutari: avans toplami ile fatura tutarindan hangisi kucukse
+  var mahsupTutar = Math.round(Math.min(toplamAvans, fatTutar) * 100) / 100;
+  if(mahsupTutar <= 0.01) return [];
+
+  // Mevcut kasa kayitlarini allocation ile faturaya bagla (yeni hareket OLUSTURMA)
+  var kalanMahsup = mahsupTutar;
+  avanslar.forEach(function(k){
+    if(kalanMahsup <= 0.01) return;
+    if(!k.allocations) k.allocations = [];
+    var dagitilan = k.allocations.reduce(function(s,a){return s+toSafeNumber(a.tutar);},0);
+    var kullanilabilir = Math.round((toSafeNumber(k.tutar) - dagitilan) * 100) / 100;
+    if(kullanilabilir <= 0.01) return;
+    var bu = Math.round(Math.min(kalanMahsup, kullanilabilir) * 100) / 100;
+    k.allocations.push({
+      kaynak_tur: 'gelir_gider',
+      kaynak_id: fatura.sb_id || '',
+      kaynak_local_id: fatura.local_ref || '',
+      tutar: bu
+    });
+    kalanMahsup = Math.round((kalanMahsup - bu) * 100) / 100;
+  });
+
+  // Sadece faturanin odeme durumunu guncelle, kasa dokunma
+  fatura.odenen = mahsupTutar;
+  fatura.kalan = Math.max(0, Math.round((fatTutar - mahsupTutar) * 100) / 100);
+  fatura.durum = fatura.kalan <= 0 ? 'Odendi' : 'Kismi Odeme';
+
+  return avanslar;
+}
+
 function applyFaturaTransaction(result){
   ensureCollections();
   ensureFisLocalRef(result.fatura);
   prependStateRecord('gelirGider',result.fatura);
   state.fatNo++;
   applyStockEffect(result.tip,result.fatura.kalemler);
+  // Kasadaki avans odemelerini yeni faturaya otomatik mahsup et
+  applyAvansToNewFatura(result.fatura);
+  result.avansChanged = [];
 }
 async function persistAndRefreshFatura(tip){
   persistCloseRefresh({
@@ -3984,9 +4104,38 @@ async function saveFatura(){
   if(validationError)return alert(validationError);
   var result=processFaturaCreate(formData);
   if(!result.ok)return alert(result.message||'Fatura kaydedilemedi.');
-  await syncGelirGiderAfterSave(result.fatura);
-  await persistAndRefreshFatura(result.tip);
-  var yeniIdx=state.gelirGider.indexOf(result.fatura);
+
+  // Avans mahsubu yapildiysa bilgi ver
+  var fatura=result.fatura;
+  if(fatura.odenen>0){
+    var mahsupMsg='Fatura kaydedildi!';
+    if(fatura.kalan<=0){
+      mahsupMsg='Fatura kaydedildi - Kasadaki avans ile tamamen karsilandi!';
+    } else if(fatura.odenen>0){
+      mahsupMsg='Fatura kaydedildi - '+fmt(fatura.odenen)+' avans mahsup edildi, kalan: '+fmt(fatura.kalan);
+    }
+    showToast(mahsupMsg);
+  }
+
+  await syncGelirGiderAfterSave(fatura);
+  // Etkilenen kasa kayitlarini da senkron et
+  var avanslar = getAvanslarForFatura ? [] : [];
+  try {
+    var kasaArr = getStateArray('kasa');
+    for(var i=0;i<kasaArr.length;i++){
+      var k=kasaArr[i];
+      if(k.allocations && k.allocations.some(function(a){
+        return a.kaynak_local_id===fatura.local_ref||(fatura.sb_id&&a.kaynak_id===fatura.sb_id);
+      })){
+        try{await syncKasaAfterSave(k);}catch(e){}
+      }
+    }
+  }catch(e){}
+
+  save();
+  closeModal('modal-fatura');
+  refreshModules(['ozet',result.tip==='satis'?'satislar':'alislar']);
+  var yeniIdx=state.gelirGider.indexOf(fatura);
   if(yeniIdx>=0) openFisDetay(yeniIdx);
 }
 function masrafDurumSec(durum){
